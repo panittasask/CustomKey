@@ -121,6 +121,8 @@ class App(ctk.CTk):
         self._filtered_items: list[dict[str, Any]] = []
         self._selected_paths: set[str] = set()
         self._page_index: int = 0
+        self._existing_file: str = ""
+        self._existing_data: dict[str, Any] | None = None
         # each entry: (checkbox_widget, bool_var, key_path)
         self._check_items: list[tuple[ctk.CTkCheckBox, tk.BooleanVar, str]] = []
         # debounce handles
@@ -139,7 +141,7 @@ class App(ctk.CTk):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)  # row 3 = main pane (shifted down by 1)
+        self.grid_rowconfigure(4, weight=1)  # row 4 = main pane
 
         # File row
         file_row = ctk.CTkFrame(self)
@@ -158,14 +160,40 @@ class App(ctk.CTk):
         )
         self._browse_btn.grid(row=0, column=2, padx=12, pady=10)
 
+        # Existing-file row
+        existing_row = ctk.CTkFrame(self)
+        existing_row.grid(row=1, column=0, padx=16, pady=(4, 0), sticky="ew")
+        existing_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(existing_row, text="Update:", width=50).grid(
+            row=0, column=0, padx=(12, 6), pady=10
+        )
+
+        self._existing_file_label = ctk.CTkLabel(
+            existing_row,
+            text="update จากไฟล์เก่า",
+            text_color="gray",
+            anchor="w",
+        )
+        self._existing_file_label.grid(row=0, column=1, padx=6, pady=10, sticky="ew")
+
+        self._choose_existing_btn = ctk.CTkButton(
+            existing_row,
+            text="Browse…",
+            width=90,
+            command=self._choose_existing_file,
+            state="disabled",
+        )
+        self._choose_existing_btn.grid(row=0, column=2, padx=12, pady=10)
+
         # Progress bar (indeterminate spinner) — hidden by default
         self._progress_bar = ctk.CTkProgressBar(self, mode="indeterminate", height=6)
-        self._progress_bar.grid(row=1, column=0, padx=16, pady=0, sticky="ew")
+        self._progress_bar.grid(row=2, column=0, padx=16, pady=0, sticky="ew")
         self._progress_bar.grid_remove()  # hidden until loading
 
         # Search + bulk-select row
         ctrl_row = ctk.CTkFrame(self)
-        ctrl_row.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
+        ctrl_row.grid(row=3, column=0, padx=16, pady=4, sticky="ew")
         ctrl_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(ctrl_row, text="Search:", width=50).grid(
@@ -192,7 +220,7 @@ class App(ctk.CTk):
 
         # Main pane: key list (left) | preview (right)
         pane = ctk.CTkFrame(self, fg_color="transparent")
-        pane.grid(row=3, column=0, padx=16, pady=4, sticky="nsew")
+        pane.grid(row=4, column=0, padx=16, pady=4, sticky="nsew")
         pane.grid_columnconfigure(0, weight=2)
         pane.grid_columnconfigure(1, weight=3)
         pane.grid_rowconfigure(0, weight=1)
@@ -243,11 +271,12 @@ class App(ctk.CTk):
 
         # Bottom: status + Convert button
         bottom = ctk.CTkFrame(self, fg_color="transparent")
-        bottom.grid(row=4, column=0, padx=16, pady=(4, 16), sticky="ew")
+        bottom.grid(row=5, column=0, padx=16, pady=(4, 16), sticky="ew")
         bottom.grid_columnconfigure(0, weight=1)
 
         self._status = ctk.CTkLabel(bottom, text="", text_color="gray")
         self._status.grid(row=0, column=0, padx=12, sticky="w")
+
         ctk.CTkButton(
             bottom, text="Convert & Save", width=160, height=40, command=self._convert
         ).grid(row=0, column=1, padx=12)
@@ -308,6 +337,7 @@ class App(ctk.CTk):
         self._value_map = {item["path"]: item["value"] for item in flat_items}
         self._selected_paths.clear()
         self._file_label.configure(text=path, text_color="white")
+        self._choose_existing_btn.configure(state="normal")
         self._search_var.set("")
         self._set_status("กำลังสร้างรายการ…", "#FFA500")
         self._apply_filter()
@@ -440,6 +470,9 @@ class App(ctk.CTk):
         generation = self._preview_generation
         selected = set(self._selected_paths)
         if not selected:
+            if self._existing_data is not None:
+                self._set_preview(json.dumps(self._existing_data, ensure_ascii=False, indent=2))
+                return
             self._set_preview("เลือก key เพื่อดู preview…")
             return
         self._set_preview("กำลังสร้าง preview…")
@@ -450,7 +483,10 @@ class App(ctk.CTk):
         ).start()
 
     def _build_preview(self, selected_paths: set[str], generation: int) -> None:
-        data = build_custom_json(selected_paths, self._value_map, self._flat_item_order)
+        if self._existing_data is not None:
+            data = self._build_updated_json(selected_paths, self._existing_data)
+        else:
+            data = build_custom_json(selected_paths, self._value_map, self._flat_item_order)
         preview_text = json.dumps(data, ensure_ascii=False, indent=2)
         self.after(0, lambda: self._finish_preview(preview_text, generation))
 
@@ -485,10 +521,40 @@ class App(ctk.CTk):
         self._preview.configure(state="normal")
         self._preview.delete("1.0", "end")
         self._preview.insert("1.0", text)
-        self._preview.configure(state="disabled")
 
     def _set_status(self, text: str, color: str = "gray") -> None:
         self._status.configure(text=text, text_color=color)
+
+    def _choose_existing_file(self) -> None:
+        if not self._source_file:
+            messagebox.showwarning("Warning", "กรุณาเลือกไฟล์หลักก่อน")
+            return
+        path = filedialog.askopenfilename(
+            title="เลือกไฟล์ custom เดิม",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์เดิมได้:\n{exc}")
+            return
+        if not isinstance(data, dict):
+            messagebox.showerror("Error", "ไฟล์เดิมต้องเป็น JSON object")
+            return
+        self._existing_file = path
+        self._existing_data = data
+        self._existing_file_label.configure(text=path, text_color="white")
+        self._set_preview(json.dumps(data, ensure_ascii=False, indent=2))
+
+    def _build_updated_json(self, selected_paths: set[str], base_data: dict[str, Any]) -> dict[str, Any]:
+        result = json.loads(json.dumps(base_data))
+        for path in self._flat_item_order:
+            if path in selected_paths and path in self._value_map:
+                insert_path(result, path, self._value_map[path])
+        return result
 
     def _convert(self) -> None:
         if not self._source_file:
@@ -498,16 +564,32 @@ class App(ctk.CTk):
         if not selected:
             messagebox.showwarning("Warning", "กรุณาเลือก key อย่างน้อย 1 รายการ")
             return
-        default_name = make_output_filename(Path(self._source_file).name)
-        save_path = filedialog.asksaveasfilename(
-            title="บันทึก custom JSON",
-            defaultextension=".json",
-            initialfile=default_name,
-            filetypes=[("JSON files", "*.json")],
-        )
-        if not save_path:
+
+        try:
+            preview_text = self._preview.get("1.0", "end-1c")
+            data = json.loads(preview_text)
+        except json.JSONDecodeError:
+            messagebox.showerror("Error", "Preview JSON ไม่ถูกต้อง กรุณาตรวจสอบ syntax")
             return
-        data = build_custom_json(selected, self._value_map, self._flat_item_order)
+        
+        if self._existing_file:
+            if not messagebox.askyesno(
+                "ยืนยันการอัปเดต",
+                f"ต้องการอัปเดตไฟล์เดิมนี้หรือไม่?\n{self._existing_file}",
+            ):
+                return
+            save_path = self._existing_file
+        else:
+            default_name = make_output_filename(Path(self._source_file).name)
+            save_path = filedialog.asksaveasfilename(
+                title="บันทึก custom JSON",
+                defaultextension=".json",
+                initialfile=default_name,
+                filetypes=[("JSON files", "*.json")],
+            )
+            if not save_path:
+                return
+
         with open(save_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
         self._set_status(f"✓ บันทึกแล้ว: {save_path}", "#4CAF50")
