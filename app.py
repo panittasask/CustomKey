@@ -1,311 +1,327 @@
 import json
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog, messagebox
 from typing import Any
 
-import streamlit as st
+import customtkinter as ctk
 
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+# ── JSON helpers ──────────────────────────────────────────────────────────────
 
 def flatten_json(data: Any, prefix: str = "") -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-
     if isinstance(data, dict):
         for key, value in data.items():
-            current_path = f"{prefix}.{key}" if prefix else key
-            items.extend(flatten_json(value, current_path))
+            path = f"{prefix}.{key}" if prefix else key
+            items.extend(flatten_json(value, path))
     elif isinstance(data, list):
-        for index, value in enumerate(data):
-            current_path = f"{prefix}[{index}]"
-            items.extend(flatten_json(value, current_path))
+        for i, value in enumerate(data):
+            items.extend(flatten_json(value, f"{prefix}[{i}]"))
     else:
         items.append({"path": prefix, "value": data})
-
     return items
 
 
 def tokenize_path(path: str) -> list[str | int]:
     tokens: list[str | int] = []
     current = ""
-    index = 0
-
-    while index < len(path):
-        char = path[index]
-
-        if char == ".":
+    i = 0
+    while i < len(path):
+        c = path[i]
+        if c == ".":
             if current:
                 tokens.append(current)
                 current = ""
-            index += 1
-            continue
-
-        if char == "[":
+        elif c == "[":
             if current:
                 tokens.append(current)
                 current = ""
-            closing_index = path.find("]", index)
-            if closing_index == -1:
-                raise ValueError(f"Invalid path: {path}")
-            array_token = path[index + 1 : closing_index]
-            if not array_token.isdigit():
-                raise ValueError(f"Invalid array index in path: {path}")
-            tokens.append(int(array_token))
-            index = closing_index + 1
-            continue
-
-        current += char
-        index += 1
-
+            j = path.find("]", i)
+            tokens.append(int(path[i + 1 : j]))
+            i = j
+        else:
+            current += c
+        i += 1
     if current:
         tokens.append(current)
-
     return tokens
-
-
-def ensure_list_size(items: list[Any], index: int) -> None:
-    while len(items) <= index:
-        items.append(None)
 
 
 def insert_path(target: dict[str, Any], path: str, value: Any) -> None:
     tokens = tokenize_path(path)
     if not tokens:
         return
-
     current: Any = target
-
-    for token_index, token in enumerate(tokens):
-        is_last = token_index == len(tokens) - 1
-        next_token = tokens[token_index + 1] if not is_last else None
-
+    for idx, token in enumerate(tokens):
+        is_last = idx == len(tokens) - 1
+        next_token = tokens[idx + 1] if not is_last else None
         if isinstance(token, str):
-            if not isinstance(current, dict):
-                raise ValueError(f"Path conflict at {path}")
-
             if is_last:
                 current[token] = value
                 return
-
-            if token not in current or current[token] is None:
+            if token not in current or not isinstance(current[token], (dict, list)):
                 current[token] = [] if isinstance(next_token, int) else {}
-
             current = current[token]
         else:
-            if not isinstance(current, list):
-                raise ValueError(f"Path conflict at {path}")
-
-            ensure_list_size(current, token)
-
+            while len(current) <= token:
+                current.append(None)
             if is_last:
                 current[token] = value
                 return
-
             if current[token] is None:
                 current[token] = [] if isinstance(next_token, int) else {}
-
             current = current[token]
 
 
-def parent_paths_from_leaf_path(leaf_path: str) -> list[str]:
-    tokens = tokenize_path(leaf_path)
-    if len(tokens) <= 1:
-        return []
-
-    parents: list[str] = []
-    for end_index in range(1, len(tokens)):
-        parent_tokens = tokens[:end_index]
-        path_text = ""
-        for token in parent_tokens:
-            if isinstance(token, str):
-                path_text = f"{path_text}.{token}" if path_text else token
-            else:
-                path_text = f"{path_text}[{token}]"
-        parents.append(path_text)
-
-    return parents
-
-
-def collect_parent_paths(flat_items: list[dict[str, Any]]) -> list[str]:
-    parent_set: set[str] = set()
-    for item in flat_items:
-        for parent in parent_paths_from_leaf_path(item["path"]):
-            parent_set.add(parent)
-    return sorted(parent_set)
-
-
-def build_custom_json(selected_paths: list[str], flat_items: list[dict[str, Any]]) -> dict[str, Any]:
-    selected_path_set = set(selected_paths)
-    selected_map = {
-        item["path"]: item["value"]
-        for item in flat_items
-        if item["path"] in selected_path_set
-    }
-
+def build_custom_json(
+    selected_paths: list[str], flat_items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    value_map = {item["path"]: item["value"] for item in flat_items}
     result: dict[str, Any] = {}
     for path in selected_paths:
-        if path in selected_map:
-            insert_path(result, path, selected_map[path])
-
+        if path in value_map:
+            insert_path(result, path, value_map[path])
     return result
 
 
-def make_output_filename(original_name: str) -> str:
-    file_path = Path(original_name)
-    if file_path.suffix.lower() == ".json":
-        return f"{file_path.stem}+custom.json"
-    return f"{file_path.name}+custom.json"
+def make_output_filename(name: str) -> str:
+    p = Path(name)
+    return f"{p.stem}+custom.json" if p.suffix.lower() == ".json" else f"{p.name}+custom.json"
 
 
-st.set_page_config(page_title="Custom i18n Key Builder", layout="wide")
-st.title("Custom i18n Key Builder")
-st.caption("Upload JSON → Search/Select keys → Convert → Download file+custom.json")
+# ── App ───────────────────────────────────────────────────────────────────────
 
-uploaded_file = st.file_uploader("Upload i18n JSON file", type=["json"])
+class App(ctk.CTk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Custom i18n Key Builder")
+        self.geometry("1200x720")
+        self.minsize(900, 580)
 
-if uploaded_file is not None:
-    try:
-        source_data = json.load(uploaded_file)
-    except json.JSONDecodeError:
-        st.error("ไฟล์ไม่ใช่ JSON ที่ถูกต้อง")
-        st.stop()
+        self._source_file: str = ""
+        self._flat_items: list[dict[str, Any]] = []
+        # each entry: (checkbox_widget, bool_var, key_path)
+        self._check_items: list[tuple[ctk.CTkCheckBox, tk.BooleanVar, str]] = []
 
-    if not isinstance(source_data, dict):
-        st.error("JSON หลักต้องเป็น object (รูปแบบ key-value)")
-        st.stop()
+        self._build_ui()
 
-    flat_items = flatten_json(source_data)
-    if not flat_items:
-        st.warning("ไม่พบ key แบบปลายทาง (leaf keys) ในไฟล์")
-        st.stop()
+    # ── UI ────────────────────────────────────────────────────────────────────
 
-    parent_paths = collect_parent_paths(flat_items)
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
 
-    search_text = st.text_input(
-        "Search by key path or value",
-        placeholder="เช่น NICE, SHARED.MAIN.NAME",
-    ).strip().lower()
+        # File row
+        file_row = ctk.CTkFrame(self)
+        file_row.grid(row=0, column=0, padx=16, pady=(16, 4), sticky="ew")
+        file_row.grid_columnconfigure(1, weight=1)
 
-    select_mode = st.radio(
-        "Selection mode",
-        options=["Leaf keys", "Parent nodes"],
-        horizontal=True,
-    )
+        ctk.CTkLabel(file_row, text="File:", width=50).grid(
+            row=0, column=0, padx=(12, 6), pady=10
+        )
+        self._file_label = ctk.CTkLabel(
+            file_row, text="ยังไม่ได้เลือกไฟล์", anchor="w", text_color="gray"
+        )
+        self._file_label.grid(row=0, column=1, padx=6, pady=10, sticky="ew")
+        ctk.CTkButton(file_row, text="Browse…", width=90, command=self._browse).grid(
+            row=0, column=2, padx=12, pady=10
+        )
 
-    if search_text:
-        filtered_items = [
+        # Search + bulk-select row
+        ctrl_row = ctk.CTkFrame(self)
+        ctrl_row.grid(row=1, column=0, padx=16, pady=4, sticky="ew")
+        ctrl_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(ctrl_row, text="Search:", width=50).grid(
+            row=0, column=0, padx=(12, 6), pady=10
+        )
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._apply_filter())
+        ctk.CTkEntry(
+            ctrl_row,
+            textvariable=self._search_var,
+            placeholder_text="ค้นหา key หรือ value…",
+        ).grid(row=0, column=1, padx=6, pady=10, sticky="ew")
+        ctk.CTkButton(
+            ctrl_row, text="Select All", width=110, command=self._select_all
+        ).grid(row=0, column=2, padx=6, pady=10)
+        ctk.CTkButton(
+            ctrl_row,
+            text="Clear",
+            width=80,
+            fg_color="#555",
+            hover_color="#444",
+            command=self._clear_all,
+        ).grid(row=0, column=3, padx=(0, 12), pady=10)
+
+        # Main pane: key list (left) | preview (right)
+        pane = ctk.CTkFrame(self, fg_color="transparent")
+        pane.grid(row=2, column=0, padx=16, pady=4, sticky="nsew")
+        pane.grid_columnconfigure(0, weight=2)
+        pane.grid_columnconfigure(1, weight=3)
+        pane.grid_rowconfigure(0, weight=1)
+
+        # Left: scrollable checkbox list
+        left = ctk.CTkFrame(pane)
+        left.grid(row=0, column=0, padx=(0, 6), sticky="nsew")
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        self._count_label = ctk.CTkLabel(left, text="Keys: –")
+        self._count_label.grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
+
+        self._scroll = ctk.CTkScrollableFrame(left)
+        self._scroll.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        self._scroll.grid_columnconfigure(0, weight=1)
+
+        # Right: JSON preview
+        right = ctk.CTkFrame(pane)
+        right.grid(row=0, column=1, padx=(6, 0), sticky="nsew")
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(right, text="Preview (JSON)").grid(
+            row=0, column=0, padx=12, pady=(10, 4), sticky="w"
+        )
+        self._preview = ctk.CTkTextbox(
+            right, font=("Consolas", 12), wrap="none", state="disabled"
+        )
+        self._preview.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
+
+        # Bottom: status + Convert button
+        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom.grid(row=3, column=0, padx=16, pady=(4, 16), sticky="ew")
+        bottom.grid_columnconfigure(0, weight=1)
+
+        self._status = ctk.CTkLabel(bottom, text="", text_color="gray")
+        self._status.grid(row=0, column=0, padx=12, sticky="w")
+        ctk.CTkButton(
+            bottom, text="Convert & Save", width=160, height=40, command=self._convert
+        ).grid(row=0, column=1, padx=12)
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _browse(self) -> None:
+        path = filedialog.askopenfilename(
+            title="เลือกไฟล์ i18n JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์ได้:\n{exc}")
+            return
+        if not isinstance(data, dict):
+            messagebox.showerror("Error", "JSON หลักต้องเป็น object")
+            return
+        self._source_file = path
+        self._flat_items = flatten_json(data)
+        self._file_label.configure(text=path, text_color="white")
+        self._search_var.set("")
+        self._apply_filter()
+        self._set_status("")
+
+    def _apply_filter(self) -> None:
+        query = self._search_var.get().strip().lower()
+        previously_checked = {path for _, var, path in self._check_items if var.get()}
+
+        for cb, _, _ in self._check_items:
+            cb.destroy()
+        self._check_items.clear()
+
+        matches = [
             item
-            for item in flat_items
-            if search_text in item["path"].lower() or search_text in str(item["value"]).lower()
+            for item in self._flat_items
+            if not query
+            or query in item["path"].lower()
+            or query in str(item["value"]).lower()
         ]
-    else:
-        filtered_items = flat_items
 
-    st.write(f"Matched keys: {len(filtered_items)}")
-
-    leaf_options = [
-        f"{item['path']} = {item['value']}"
-        for item in flat_items
-    ]
-    matched_leaf_options = [
-        f"{item['path']} = {item['value']}"
-        for item in filtered_items
-    ]
-    leaf_option_to_path = {
-        f"{item['path']} = {item['value']}": item["path"]
-        for item in flat_items
-    }
-
-    if search_text:
-        matched_parent_options = [
-            parent_path
-            for parent_path in parent_paths
-            if search_text in parent_path.lower()
-        ]
-    else:
-        matched_parent_options = parent_paths
-
-    file_identity = f"{uploaded_file.name}:{uploaded_file.size}"
-    if st.session_state.get("file_identity") != file_identity:
-        st.session_state["file_identity"] = file_identity
-        st.session_state["selected_leaf_options"] = []
-        st.session_state["selected_parent_options"] = []
-
-    if "selected_leaf_options" not in st.session_state:
-        st.session_state["selected_leaf_options"] = []
-    if "selected_parent_options" not in st.session_state:
-        st.session_state["selected_parent_options"] = []
-
-    control_left, control_right = st.columns(2)
-    with control_left:
-        if st.button("Select all matched"):
-            if select_mode == "Leaf keys":
-                current = set(st.session_state["selected_leaf_options"])
-                current.update(matched_leaf_options)
-                st.session_state["selected_leaf_options"] = sorted(current)
-            else:
-                current = set(st.session_state["selected_parent_options"])
-                current.update(matched_parent_options)
-                st.session_state["selected_parent_options"] = sorted(current)
-    with control_right:
-        if st.button("Clear selection"):
-            if select_mode == "Leaf keys":
-                st.session_state["selected_leaf_options"] = []
-            else:
-                st.session_state["selected_parent_options"] = []
-
-    if select_mode == "Leaf keys":
-        selected_options = st.multiselect(
-            "Select keys to include in custom file",
-            options=leaf_options,
-            key="selected_leaf_options",
-        )
-        st.caption(f"Selected leaf keys: {len(selected_options)}")
-        selected_paths = [leaf_option_to_path[option] for option in selected_options]
-    else:
-        selected_parents = st.multiselect(
-            "Select parent nodes to include all child keys",
-            options=parent_paths,
-            key="selected_parent_options",
-        )
-        st.caption(f"Selected parent nodes: {len(selected_parents)}")
-        selected_paths = []
-        for item in flat_items:
+        for item in matches:
             path = item["path"]
-            if any(path == parent or path.startswith(f"{parent}.") for parent in selected_parents):
-                selected_paths.append(path)
+            var = tk.BooleanVar(value=path in previously_checked)
+            var.trace_add("write", lambda *_: self._on_check())
+            label = f"{path}  =  {item['value']}"
+            cb = ctk.CTkCheckBox(
+                self._scroll,
+                text=label,
+                variable=var,
+                onvalue=True,
+                offvalue=False,
+            )
+            cb.grid(sticky="w", padx=4, pady=2)
+            self._check_items.append((cb, var, path))
 
-    with st.expander("Preview matched results"):
-        preview_limit = 200
-        if select_mode == "Leaf keys":
-            preview_items = matched_leaf_options[:preview_limit]
-        else:
-            preview_items = matched_parent_options[:preview_limit]
+        self._update_count()
+        self._update_preview()
 
-        if preview_items:
-            st.write("\n".join(preview_items))
-            if (select_mode == "Leaf keys" and len(matched_leaf_options) > preview_limit) or (
-                select_mode == "Parent nodes" and len(matched_parent_options) > preview_limit
-            ):
-                st.caption("แสดงตัวอย่างสูงสุด 200 รายการ")
-        else:
-            st.write("ไม่พบรายการตามคำค้นหา")
+    def _on_check(self) -> None:
+        self._update_count()
+        self._update_preview()
 
-    if st.button("Convert", type="primary"):
-        selected_paths = list(dict.fromkeys(selected_paths))
+    def _select_all(self) -> None:
+        for _, var, _ in self._check_items:
+            var.set(True)
 
-        if not selected_paths:
-            st.warning("กรุณาเลือก key อย่างน้อย 1 รายการ")
-            st.stop()
+    def _clear_all(self) -> None:
+        for _, var, _ in self._check_items:
+            var.set(False)
 
-        custom_data = build_custom_json(selected_paths, flat_items)
-        output_filename = make_output_filename(uploaded_file.name)
-        output_json = json.dumps(custom_data, ensure_ascii=False, indent=2)
-
-        st.success("Convert สำเร็จ")
-        st.code(output_json, language="json")
-        st.download_button(
-            label=f"Download {output_filename}",
-            data=output_json.encode("utf-8"),
-            file_name=output_filename,
-            mime="application/json",
+    def _update_count(self) -> None:
+        matched = len(self._check_items)
+        selected = sum(1 for _, var, _ in self._check_items if var.get())
+        self._count_label.configure(
+            text=f"Keys: {matched} matched  •  {selected} selected"
         )
-else:
-    st.info("อัปโหลดไฟล์ i18n JSON เพื่อเริ่มใช้งาน")
+
+    def _update_preview(self) -> None:
+        selected = [path for _, var, path in self._check_items if var.get()]
+        if not selected:
+            self._set_preview("เลือก key เพื่อดู preview…")
+            return
+        data = build_custom_json(selected, self._flat_items)
+        self._set_preview(json.dumps(data, ensure_ascii=False, indent=2))
+
+    def _set_preview(self, text: str) -> None:
+        self._preview.configure(state="normal")
+        self._preview.delete("1.0", "end")
+        self._preview.insert("1.0", text)
+        self._preview.configure(state="disabled")
+
+    def _set_status(self, text: str, color: str = "gray") -> None:
+        self._status.configure(text=text, text_color=color)
+
+    def _convert(self) -> None:
+        if not self._source_file:
+            messagebox.showwarning("Warning", "กรุณาเลือกไฟล์ก่อน")
+            return
+        selected = [path for _, var, path in self._check_items if var.get()]
+        if not selected:
+            messagebox.showwarning("Warning", "กรุณาเลือก key อย่างน้อย 1 รายการ")
+            return
+        default_name = make_output_filename(Path(self._source_file).name)
+        save_path = filedialog.asksaveasfilename(
+            title="บันทึก custom JSON",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not save_path:
+            return
+        data = build_custom_json(selected, self._flat_items)
+        with open(save_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        self._set_status(f"✓ บันทึกแล้ว: {save_path}", "#4CAF50")
+        messagebox.showinfo("Done", f"บันทึกไฟล์แล้วที่:\n{save_path}")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
