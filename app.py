@@ -112,6 +112,9 @@ class App(ctk.CTk):
         self._preview_debounce_id: str | None = None
         # track batch build so stale batches can be cancelled
         self._build_generation: int = 0
+        # spinner state
+        self._spinner_id: str | None = None
+        self._is_loading: bool = False
 
         self._build_ui()
 
@@ -119,11 +122,11 @@ class App(ctk.CTk):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)  # row 3 = main pane (shifted down by 1)
 
         # File row
         file_row = ctk.CTkFrame(self)
-        file_row.grid(row=0, column=0, padx=16, pady=(16, 4), sticky="ew")
+        file_row.grid(row=0, column=0, padx=16, pady=(16, 0), sticky="ew")
         file_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(file_row, text="File:", width=50).grid(
@@ -133,13 +136,19 @@ class App(ctk.CTk):
             file_row, text="ยังไม่ได้เลือกไฟล์", anchor="w", text_color="gray"
         )
         self._file_label.grid(row=0, column=1, padx=6, pady=10, sticky="ew")
-        ctk.CTkButton(file_row, text="Browse…", width=90, command=self._browse).grid(
-            row=0, column=2, padx=12, pady=10
+        self._browse_btn = ctk.CTkButton(
+            file_row, text="Browse…", width=90, command=self._browse
         )
+        self._browse_btn.grid(row=0, column=2, padx=12, pady=10)
+
+        # Progress bar (indeterminate spinner) — hidden by default
+        self._progress_bar = ctk.CTkProgressBar(self, mode="indeterminate", height=6)
+        self._progress_bar.grid(row=1, column=0, padx=16, pady=0, sticky="ew")
+        self._progress_bar.grid_remove()  # hidden until loading
 
         # Search + bulk-select row
         ctrl_row = ctk.CTkFrame(self)
-        ctrl_row.grid(row=1, column=0, padx=16, pady=4, sticky="ew")
+        ctrl_row.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
         ctrl_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(ctrl_row, text="Search:", width=50).grid(
@@ -166,7 +175,7 @@ class App(ctk.CTk):
 
         # Main pane: key list (left) | preview (right)
         pane = ctk.CTkFrame(self, fg_color="transparent")
-        pane.grid(row=2, column=0, padx=16, pady=4, sticky="nsew")
+        pane.grid(row=3, column=0, padx=16, pady=4, sticky="nsew")
         pane.grid_columnconfigure(0, weight=2)
         pane.grid_columnconfigure(1, weight=3)
         pane.grid_rowconfigure(0, weight=1)
@@ -200,7 +209,7 @@ class App(ctk.CTk):
 
         # Bottom: status + Convert button
         bottom = ctk.CTkFrame(self, fg_color="transparent")
-        bottom.grid(row=3, column=0, padx=16, pady=(4, 16), sticky="ew")
+        bottom.grid(row=4, column=0, padx=16, pady=(4, 16), sticky="ew")
         bottom.grid_columnconfigure(0, weight=1)
 
         self._status = ctk.CTkLabel(bottom, text="", text_color="gray")
@@ -211,6 +220,22 @@ class App(ctk.CTk):
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
+    # ── Spinner helpers ───────────────────────────────────────────────────────
+
+    def _start_loading(self, message: str = "กำลังโหลด…") -> None:
+        self._is_loading = True
+        self._browse_btn.configure(state="disabled")
+        self._progress_bar.grid()          # show
+        self._progress_bar.start()         # animate
+        self._set_status(message, "#FFA500")
+
+    def _stop_loading(self) -> None:
+        self._is_loading = False
+        self._progress_bar.stop()
+        self._progress_bar.grid_remove()   # hide
+        self._browse_btn.configure(state="normal")
+        self._set_status("")
+
     def _browse(self) -> None:
         path = filedialog.askopenfilename(
             title="เลือกไฟล์ i18n JSON",
@@ -218,7 +243,7 @@ class App(ctk.CTk):
         )
         if not path:
             return
-        self._set_status("กำลังโหลด…", "#FFA500")
+        self._start_loading("กำลังอ่านไฟล์…")
         self._file_label.configure(text=path, text_color="gray")
         threading.Thread(target=self._load_file, args=(path,), daemon=True).start()
 
@@ -228,15 +253,18 @@ class App(ctk.CTk):
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as exc:
-            self.after(0, lambda: messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์ได้:\n{exc}"))
-            self.after(0, lambda: self._set_status(""))
+            self.after(0, lambda: (
+                self._stop_loading(),
+                messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์ได้:\n{exc}"),
+            ))
             return
         if not isinstance(data, dict):
-            self.after(0, lambda: messagebox.showerror("Error", "JSON หลักต้องเป็น object"))
-            self.after(0, lambda: self._set_status(""))
+            self.after(0, lambda: (
+                self._stop_loading(),
+                messagebox.showerror("Error", "JSON หลักต้องเป็น object"),
+            ))
             return
         flat = flatten_json(data)
-        # schedule UI update back on main thread
         self.after(0, lambda: self._on_file_loaded(path, flat))
 
     def _on_file_loaded(self, path: str, flat_items: list[dict[str, Any]]) -> None:
@@ -244,7 +272,7 @@ class App(ctk.CTk):
         self._flat_items = flat_items
         self._file_label.configure(text=path, text_color="white")
         self._search_var.set("")
-        self._set_status("")
+        self._set_status("กำลังสร้างรายการ…", "#FFA500")
         self._apply_filter()
 
     # ── Debounce helpers ──────────────────────────────────────────────────────
@@ -280,8 +308,11 @@ class App(ctk.CTk):
 
         # bump generation so any stale batch stops
         self._build_generation += 1
+        gen = self._build_generation
         self._count_label.configure(text=f"Keys: {len(matches)} matched  •  กำลังโหลด…")
-        self._build_batch(matches, previously_checked, 0, self._build_generation)
+        if not self._is_loading:
+            self._start_loading("กำลังสร้างรายการ…")
+        self._build_batch(matches, previously_checked, 0, gen)
 
     _BATCH_SIZE = 40  # widgets per frame — tune as needed
 
@@ -315,10 +346,13 @@ class App(ctk.CTk):
         self._update_count()
 
         if end < len(items):
+            total = len(items)
+            self._set_status(f"กำลังสร้างรายการ… {end}/{total}", "#FFA500")
             # schedule next batch — gives event loop a chance to breathe
             self.after(0, lambda: self._build_batch(items, previously_checked, end, generation))
         else:
-            # all done — render final preview
+            # all done
+            self._stop_loading()
             self._update_preview()
 
     def _on_check(self) -> None:
