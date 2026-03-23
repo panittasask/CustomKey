@@ -1,4 +1,5 @@
 import json
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -106,6 +107,11 @@ class App(ctk.CTk):
         self._flat_items: list[dict[str, Any]] = []
         # each entry: (checkbox_widget, bool_var, key_path)
         self._check_items: list[tuple[ctk.CTkCheckBox, tk.BooleanVar, str]] = []
+        # debounce handles
+        self._search_debounce_id: str | None = None
+        self._preview_debounce_id: str | None = None
+        # track batch build so stale batches can be cancelled
+        self._build_generation: int = 0
 
         self._build_ui()
 
@@ -140,7 +146,7 @@ class App(ctk.CTk):
             row=0, column=0, padx=(12, 6), pady=10
         )
         self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._apply_filter())
+        self._search_var.trace_add("write", lambda *_: self._schedule_filter())
         ctk.CTkEntry(
             ctrl_row,
             textvariable=self._search_var,
@@ -212,26 +218,54 @@ class App(ctk.CTk):
         )
         if not path:
             return
+        self._set_status("กำลังโหลด…", "#FFA500")
+        self._file_label.configure(text=path, text_color="gray")
+        threading.Thread(target=self._load_file, args=(path,), daemon=True).start()
+
+    def _load_file(self, path: str) -> None:
+        """Runs in background thread — parse JSON then hand off to main thread."""
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as exc:
-            messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์ได้:\n{exc}")
+            self.after(0, lambda: messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์ได้:\n{exc}"))
+            self.after(0, lambda: self._set_status(""))
             return
         if not isinstance(data, dict):
-            messagebox.showerror("Error", "JSON หลักต้องเป็น object")
+            self.after(0, lambda: messagebox.showerror("Error", "JSON หลักต้องเป็น object"))
+            self.after(0, lambda: self._set_status(""))
             return
+        flat = flatten_json(data)
+        # schedule UI update back on main thread
+        self.after(0, lambda: self._on_file_loaded(path, flat))
+
+    def _on_file_loaded(self, path: str, flat_items: list[dict[str, Any]]) -> None:
         self._source_file = path
-        self._flat_items = flatten_json(data)
+        self._flat_items = flat_items
         self._file_label.configure(text=path, text_color="white")
         self._search_var.set("")
-        self._apply_filter()
         self._set_status("")
+        self._apply_filter()
+
+    # ── Debounce helpers ──────────────────────────────────────────────────────
+
+    def _schedule_filter(self) -> None:
+        if self._search_debounce_id:
+            self.after_cancel(self._search_debounce_id)
+        self._search_debounce_id = self.after(300, self._apply_filter)
+
+    def _schedule_preview(self) -> None:
+        if self._preview_debounce_id:
+            self.after_cancel(self._preview_debounce_id)
+        self._preview_debounce_id = self.after(200, self._update_preview)
+
+    # ── Filter & render ───────────────────────────────────────────────────────
 
     def _apply_filter(self) -> None:
         query = self._search_var.get().strip().lower()
         previously_checked = {path for _, var, path in self._check_items if var.get()}
 
+        # destroy existing widgets
         for cb, _, _ in self._check_items:
             cb.destroy()
         self._check_items.clear()
@@ -244,7 +278,26 @@ class App(ctk.CTk):
             or query in str(item["value"]).lower()
         ]
 
-        for item in matches:
+        # bump generation so any stale batch stops
+        self._build_generation += 1
+        self._count_label.configure(text=f"Keys: {len(matches)} matched  •  กำลังโหลด…")
+        self._build_batch(matches, previously_checked, 0, self._build_generation)
+
+    _BATCH_SIZE = 40  # widgets per frame — tune as needed
+
+    def _build_batch(
+        self,
+        items: list[dict[str, Any]],
+        previously_checked: set[str],
+        start: int,
+        generation: int,
+    ) -> None:
+        """Create checkboxes in small batches, yielding to the event loop between each."""
+        if generation != self._build_generation:
+            return  # stale — a newer filter was triggered
+
+        end = min(start + self._BATCH_SIZE, len(items))
+        for item in items[start:end]:
             path = item["path"]
             var = tk.BooleanVar(value=path in previously_checked)
             var.trace_add("write", lambda *_: self._on_check())
@@ -260,11 +313,17 @@ class App(ctk.CTk):
             self._check_items.append((cb, var, path))
 
         self._update_count()
-        self._update_preview()
+
+        if end < len(items):
+            # schedule next batch — gives event loop a chance to breathe
+            self.after(0, lambda: self._build_batch(items, previously_checked, end, generation))
+        else:
+            # all done — render final preview
+            self._update_preview()
 
     def _on_check(self) -> None:
         self._update_count()
-        self._update_preview()
+        self._schedule_preview()
 
     def _select_all(self) -> None:
         for _, var, _ in self._check_items:
