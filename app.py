@@ -102,6 +102,12 @@ def make_output_filename(name: str) -> str:
     return f"{p.stem}+custom.json" if p.suffix.lower() == ".json" else f"{p.name}+custom.json"
 
 
+def load_json_file(path: str) -> Any:
+    # utf-8-sig transparently handles UTF-8 BOM and normal UTF-8.
+    with open(path, encoding="utf-8-sig") as fh:
+        return json.load(fh)
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
@@ -313,8 +319,7 @@ class App(ctk.CTk):
     def _load_file(self, path: str) -> None:
         """Runs in background thread — parse JSON then hand off to main thread."""
         try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = load_json_file(path)
         except Exception as exc:
             self.after(0, lambda: (
                 self._stop_loading(),
@@ -536,8 +541,7 @@ class App(ctk.CTk):
         if not path:
             return
         try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = load_json_file(path)
         except Exception as exc:
             messagebox.showerror("Error", f"ไม่สามารถอ่านไฟล์เดิมได้:\n{exc}")
             return
